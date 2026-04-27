@@ -33,6 +33,8 @@ LOG_LEVEL=DEBUG uv run python main.py
 
 At INFO (default) you still see one line per `claude -p` call with rc, duration, turn count, token counts, and cost. On failures the actual API error message (from the JSON envelope's `result`) is now surfaced through the 502 — you no longer get a bare `exited with code 1: ` with empty stderr.
 
+If responses ever come back nonsensical (e.g. mentioning "hooks", "feedback", or "stopped" out of context), set `CLAUDE_DEBUG=1` to add `--debug=api,hooks` to the subprocess; subprocess stderr is then dumped at DEBUG level and you can see which user-level hook from `~/.claude/settings.json` is firing. The proxy already passes `--disable-slash-commands` and `--no-session-persistence` to neutralize skills and session writes, but hooks in `~/.claude/settings.json` cannot be turned off without losing OAuth (`--bare`).
+
 ## Run
 
 ```bash

@@ -76,14 +76,24 @@ class ClaudeError(RuntimeError):
 
 
 def _base_args(model: str, system_prompt: str) -> list[str]:
-    return [
+    args = [
         "-p",
         f"--model={model}",
         f"--mcp-config={_empty_mcp_config_path()}",
         f"--system-prompt={system_prompt}",
         "--allowedTools=",
         "--permission-mode=dontAsk",
+        # Without these, Claude Code auto-loads user-level skills and persists sessions
+        # — both can inject content into the subprocess (skills like `claude-api` may
+        # auto-trigger on certain prompts; persisted sessions waste disk and pollute history).
+        "--disable-slash-commands",
+        "--no-session-persistence",
     ]
+    if os.environ.get("CLAUDE_DEBUG"):
+        # Streams diagnostics for hooks / API / file events to the subprocess stderr.
+        # Useful when a stray hook in `~/.claude/settings.json` is hijacking responses.
+        args.append("--debug=api,hooks")
+    return args
 
 
 async def run_oneshot(
@@ -186,6 +196,8 @@ async def run_oneshot(
         log.debug("result text: %s", _truncate(result_text, 600))
         if struct is not None:
             log.debug("structured_output: %s", _truncate(json.dumps(struct, ensure_ascii=False), 800))
+        if stderr.strip():
+            log.debug("stderr (success): %s", _truncate(stderr.strip(), 2000))
     return ClaudeResult(raw=envelope, stderr=stderr)
 
 
