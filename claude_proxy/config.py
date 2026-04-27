@@ -12,11 +12,13 @@ class Config:
     claude_timeout_s: float
     default_model: str
     log_level: str
+    default_effort: str | None  # None = let the model decide (`--effort` not passed)
 
     @classmethod
     def from_env(cls) -> "Config":
         sandbox = Path(os.environ.get("SANDBOX_DIR", "/tmp/claude-as-api/sandbox")).resolve()
         sandbox.mkdir(parents=True, exist_ok=True)
+        effort = os.environ.get("EFFORT", "medium").strip().lower() or "auto"
         return cls(
             claude_bin=os.environ.get("CLAUDE_BIN", "claude"),
             sandbox_dir=sandbox,
@@ -25,7 +27,27 @@ class Config:
             claude_timeout_s=float(os.environ.get("CLAUDE_TIMEOUT_S", "300")),
             default_model=os.environ.get("DEFAULT_MODEL", "claude-sonnet-4-6"),
             log_level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+            default_effort=None if effort == "auto" else effort,
         )
+
+
+_VALID_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+
+def normalize_effort(value: str | None) -> str | None:
+    """Map an effort hint to a claude `--effort` value, or None to skip the flag.
+
+    Accepts both Claude levels (`low/medium/high/xhigh/max`) and OpenAI's
+    `reasoning_effort` (`low/medium/high`); empty / `auto` / unrecognized → None.
+    """
+    if not value:
+        return None
+    v = str(value).strip().lower()
+    if v in ("auto", ""):
+        return None
+    if v in _VALID_EFFORTS:
+        return v
+    return None
 
 
 MODEL_MAP: dict[str, str] = {

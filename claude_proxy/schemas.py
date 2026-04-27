@@ -53,6 +53,7 @@ class ChatCompletionRequest(BaseModel):
     top_p: float | None = None
     max_tokens: int | None = None
     user: str | None = None
+    reasoning_effort: str | None = None  # OpenAI o1-style; per-request override
 
 
 class Usage(BaseModel):

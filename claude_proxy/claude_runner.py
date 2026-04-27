@@ -20,6 +20,18 @@ def _truncate(s: str, n: int = 800) -> str:
     return f"{s[:n]} ...[+{len(s) - n} chars]"
 
 
+def _hex_head(s: str, n: int = 96) -> str:
+    """Hex of the first `n` UTF-8 bytes plus a count of replacement chars (\\ufffd).
+
+    Useful for checking whether Cyrillic / emoji round-trips intact. If the
+    string already contains U+FFFD, the corruption happened upstream of us
+    (request body or client) — not in our subprocess pipeline.
+    """
+    head = s[:n].encode("utf-8", errors="replace")
+    bad = s.count("�")
+    return f"{head.hex(' ')} (len={len(s)} chars, replacement_chars={bad})"
+
+
 # Note on tool blocking:
 # `--disallowedTools` blocks *execution* but does not strip tools from the Anthropic API
 # request body — and one of Claude Code's built-in tools (`TaskOutput`) ships with an
@@ -62,7 +74,19 @@ _BILLING_OVERRIDES = (
 
 def sanitized_env() -> dict[str, str]:
     env = {k: v for k, v in os.environ.items() if k not in _BILLING_OVERRIDES}
+    # Force a UTF-8 locale for the subprocess so Cyrillic / emoji / other multi-byte
+    # text round-trips cleanly. Many minimal VM/container images come with `LANG=C`
+    # which makes argv / stdout encoding fall back to ASCII and replace bytes with
+    # `?` or `�`. We only override when the parent locale isn't already UTF-8.
+    if not _looks_utf8(env.get("LC_ALL", "")) and not _looks_utf8(env.get("LANG", "")):
+        env["LC_ALL"] = "C.UTF-8"
+        env["LANG"] = "C.UTF-8"
     return env
+
+
+def _looks_utf8(value: str) -> bool:
+    v = value.lower()
+    return "utf-8" in v or "utf8" in v
 
 
 @dataclass
@@ -75,7 +99,7 @@ class ClaudeError(RuntimeError):
     pass
 
 
-def _base_args(model: str, system_prompt: str) -> list[str]:
+def _base_args(model: str, system_prompt: str, effort: str | None = None) -> list[str]:
     args = [
         "-p",
         f"--model={model}",
@@ -89,6 +113,8 @@ def _base_args(model: str, system_prompt: str) -> list[str]:
         "--disable-slash-commands",
         "--no-session-persistence",
     ]
+    if effort:
+        args.append(f"--effort={effort}")
     if os.environ.get("CLAUDE_DEBUG"):
         # Streams diagnostics for hooks / API / file events to the subprocess stderr.
         # Useful when a stray hook in `~/.claude/settings.json` is hijacking responses.
@@ -105,9 +131,10 @@ async def run_oneshot(
     user_prompt: str,
     json_schema: dict | None,
     timeout_s: float,
+    effort: str | None = None,
 ) -> ClaudeResult:
     """Run claude -p once and return the parsed JSON envelope."""
-    args = [claude_bin, *_base_args(model, system_prompt), "--output-format=json"]
+    args = [claude_bin, *_base_args(model, system_prompt, effort), "--output-format=json"]
     if json_schema is not None:
         args.append(f"--json-schema={json.dumps(json_schema, ensure_ascii=False)}")
     args.append(user_prompt)
@@ -120,6 +147,7 @@ async def run_oneshot(
     if log.isEnabledFor(logging.DEBUG):
         log.debug("system prompt: %s", _truncate(system_prompt))
         log.debug("user prompt: %s", _truncate(user_prompt))
+        log.debug("user prompt utf8 bytes head: %s", _hex_head(user_prompt))
         if json_schema is not None:
             log.debug("json_schema: %s", _truncate(json.dumps(json_schema, ensure_ascii=False)))
         # Mask huge prompt args in argv but show flag shape.
@@ -128,6 +156,7 @@ async def run_oneshot(
     started = time.monotonic()
     proc = await asyncio.create_subprocess_exec(
         *args,
+        stdin=asyncio.subprocess.DEVNULL,  # claude -p otherwise waits 3s on stdin
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env=sanitized_env(),
@@ -209,6 +238,8 @@ async def run_streaming(
     system_prompt: str,
     user_prompt: str,
     timeout_s: float,
+    json_schema: dict | None = None,
+    effort: str | None = None,
 ) -> AsyncIterator[dict]:
     """Yield parsed stream-json events from claude -p.
 
@@ -217,12 +248,14 @@ async def run_streaming(
     """
     args = [
         claude_bin,
-        *_base_args(model, system_prompt),
+        *_base_args(model, system_prompt, effort),
         "--output-format=stream-json",
         "--verbose",
         "--include-partial-messages",
-        user_prompt,
     ]
+    if json_schema is not None:
+        args.append(f"--json-schema={json.dumps(json_schema, ensure_ascii=False)}")
+    args.append(user_prompt)
 
     log.info(
         "claude -p stream spawn: model=%s cwd=%s system_chars=%d user_chars=%d",
@@ -234,6 +267,7 @@ async def run_streaming(
 
     proc = await asyncio.create_subprocess_exec(
         *args,
+        stdin=asyncio.subprocess.DEVNULL,  # claude -p otherwise waits 3s on stdin
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env=sanitized_env(),

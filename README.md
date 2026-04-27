@@ -47,7 +47,9 @@ uv run python main.py            # listens on 127.0.0.1:8000
 #   MAX_CONCURRENT=4              # parallel claude -p subprocesses
 #   CLAUDE_TIMEOUT_S=300
 #   DEFAULT_MODEL=claude-sonnet-4-6
+#   EFFORT=medium                 # thinking effort: low|medium|high|xhigh|max|auto (auto = let model pick)
 #   SANDBOX_DIR=/tmp/claude-as-api/sandbox  # cwd for subprocesses; keep empty
+#   CLAUDE_DEBUG=1                # forward `--debug=api,hooks` and dump subprocess stderr at DEBUG
 ```
 
 ## Use from any OpenAI-compatible client
@@ -138,9 +140,9 @@ What you lose: per-branch `required` fields and strict mutual exclusion. The mod
 
 ## How tools are emulated
 
-OpenAI tool calling has the model return `tool_calls` and the *client* execute them. Claude Code's native paradigm is the agent executing its own internal tools.
+OpenAI semantics: the model returns `tool_calls`, **your client executes them**, and posts back a `role: tool` message on the next request. **The proxy never executes your tools** — `obsidian_search`, `get_weather`, etc. are just names + JSON schemas that get round-tripped to the model.
 
-This service bridges the two by passing `--json-schema` to `claude -p`, forcing the model to return either:
+To make Claude follow those semantics (its native loop runs tools internally instead), the service passes `--json-schema` to `claude -p`, forcing the model to return either:
 
 ```json
 {"kind": "tool_calls", "tool_calls": [{"name": "...", "arguments": {...}}]}
@@ -154,12 +156,53 @@ or:
 
 The schema avoids `oneOf`/`anyOf` — those trigger a Claude Code internal-tool injection path that can fail with `tools.N.custom.input_schema.type: Field required` against the Anthropic API. See `claude_proxy/tools_bridge.py`.
 
+> **About `num_turns=2-3` you'll see in the logs:** that's an artifact of Claude Code's structured-output implementation, not the number of tools your model called. When `--json-schema` is passed, Claude Code wraps the response generation in its own internal tool-calling loop (a hidden `StructuredOutput` tool that Claude Code "executes" locally by extracting the JSON payload). Plain chat without `--json-schema` stays at `num_turns=1`. None of this involves your OpenAI tools — those round-trip through your client as usual.
+
+## Thinking / reasoning
+
+When the model thinks (Claude Haiku 4.5 does so by default; Sonnet/Opus on demand), thinking deltas are streamed as `delta.reasoning_content` in SSE chunks — the field used by DeepSeek and supported by Open WebUI, LibreChat, etc. It works in **both** plain streaming and `stream=True + tools`/`response_format` modes:
+
+```python
+for chunk in c.chat.completions.create(
+    model="claude-haiku-4-5",
+    messages=[{"role": "user", "content": "explain RSA briefly"}],
+    stream=True,
+):
+    d = chunk.choices[0].delta
+    if getattr(d, "reasoning_content", None):
+        print(f"[think] {d.reasoning_content}", end="", flush=True)
+    if d.content:
+        print(d.content, end="", flush=True)
+```
+
+### Effort level
+
+Set how hard the model thinks via Claude Code's `--effort`. Levels: `low | medium | high | xhigh | max`. Two ways:
+
+```bash
+EFFORT=medium uv run python main.py    # server-wide default; this is the default-default
+EFFORT=auto   uv run python main.py    # let the model choose (no --effort passed)
+```
+
+```python
+# Per-request override (OpenAI o1 convention):
+c.chat.completions.create(
+    model="claude-sonnet-4-6",
+    messages=[...],
+    extra_body={"reasoning_effort": "high"},
+)
+```
+
+Per-request `reasoning_effort` wins over the env default. Unrecognized values fall back to "auto".
+
 ## Caveats
 
-- **Streaming + tools is non-streaming under the hood.** When `tools` are present, structured output requires the full JSON to assemble before parsing, so the response is delivered as a single OpenAI chunk at the end. Plain chat streams normally.
+- **`stream=True && tools` streams thinking, not text.** The final tool_calls/content arrives as a single SSE chunk at the end (because structured output assembles a complete JSON payload). Thinking still streams live in `reasoning_content` deltas while the model works.
 - **Stateless conversations.** Send the full message history each call (matches OpenAI semantics). The service does not retain `session_id`s.
 - **Cost overhead per call.** Claude Code loads its tool registry into context regardless of `--allowedTools` or empty `--mcp-config`, so each call has a few-thousand-token baseline. Within the 5-minute prompt cache TTL these are cache reads (cheap on the API but still billed at your subscription's rate).
-- **No `--bare`.** It would skip OAuth and fail subscription auth.
+- **No `--bare` mode.** It would skip OAuth and break subscription auth. Side effect: hooks defined in `~/.claude/settings.json` still run (skills are disabled via `--disable-slash-commands`, but hooks can't be turned off without `--bare`). If a hook starts hijacking responses with text like "Hook feedback stopped", set `CLAUDE_DEBUG=1` to identify it.
+- **Encoding.** On VMs with `LANG=C`, multi-byte chars (Cyrillic, emoji) can be mangled in argv. The runner forces `LC_ALL=C.UTF-8` in the subprocess; for the parent uvicorn process run with `PYTHONUTF8=1` if you suspect host locale issues. DEBUG logs include hex of the prompt's first bytes and a count of `�` chars to localize where corruption enters.
+- **Some flag forms are mandatory.** `claude -p` greedy-multi-value flags (`--mcp-config`, `--system-prompt`, `--json-schema`) must be passed as `--flag=value`, not `--flag value`, or they swallow the prompt as their argument. The runner already does this; do not refactor argv assembly to space-separated form.
 
 ## Tests
 
