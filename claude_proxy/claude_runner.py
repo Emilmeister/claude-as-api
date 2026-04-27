@@ -6,11 +6,18 @@ import json
 import logging
 import os
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import AsyncIterator
 
 log = logging.getLogger(__name__)
+
+
+def _truncate(s: str, n: int = 800) -> str:
+    if len(s) <= n:
+        return s
+    return f"{s[:n]} ...[+{len(s) - n} chars]"
 
 
 # Note on tool blocking:
@@ -95,8 +102,20 @@ async def run_oneshot(
         args.append(f"--json-schema={json.dumps(json_schema, ensure_ascii=False)}")
     args.append(user_prompt)
 
-    log.debug("spawning claude: cwd=%s argv[0..3]=%s", cwd, args[:4])
+    log.info(
+        "claude -p spawn: model=%s cwd=%s system_chars=%d user_chars=%d schema=%s",
+        model, cwd, len(system_prompt), len(user_prompt),
+        "yes" if json_schema is not None else "no",
+    )
+    if log.isEnabledFor(logging.DEBUG):
+        log.debug("system prompt: %s", _truncate(system_prompt))
+        log.debug("user prompt: %s", _truncate(user_prompt))
+        if json_schema is not None:
+            log.debug("json_schema: %s", _truncate(json.dumps(json_schema, ensure_ascii=False)))
+        # Mask huge prompt args in argv but show flag shape.
+        log.debug("argv flags: %s", [a if not a.startswith(("--system-prompt=", "--json-schema=")) else a.split("=", 1)[0] + "=<...>" for a in args[:-1]])
 
+    started = time.monotonic()
     proc = await asyncio.create_subprocess_exec(
         *args,
         stdout=asyncio.subprocess.PIPE,
@@ -114,19 +133,59 @@ async def run_oneshot(
             proc.kill()
         raise ClaudeError(f"claude -p timed out after {timeout_s}s")
 
+    duration = time.monotonic() - started
     stderr = stderr_b.decode("utf-8", errors="replace")
-    if proc.returncode != 0:
+    stdout = stdout_b.decode("utf-8", errors="replace").strip()
+
+    # Try to parse stdout regardless of exit code — claude -p often emits a JSON
+    # envelope with `is_error: true` on Anthropic API failures while exiting non-zero.
+    envelope: dict | None = None
+    if stdout:
+        try:
+            envelope = json.loads(stdout)
+        except json.JSONDecodeError:
+            envelope = None
+
+    if proc.returncode != 0 or (isinstance(envelope, dict) and envelope.get("is_error")):
+        # Surface the most useful error string we can find.
+        api_msg = ""
+        if isinstance(envelope, dict):
+            api_msg = (envelope.get("result") or "").strip()
+        log.error(
+            "claude -p failed: rc=%s duration=%.2fs is_error=%s api_msg=%s stderr=%s",
+            proc.returncode, duration,
+            envelope.get("is_error") if isinstance(envelope, dict) else None,
+            _truncate(api_msg, 600),
+            _truncate(stderr.strip(), 600),
+        )
+        if log.isEnabledFor(logging.DEBUG) and isinstance(envelope, dict):
+            log.debug("full error envelope: %s", _truncate(json.dumps(envelope, ensure_ascii=False), 4000))
+        detail = api_msg or stderr.strip() or f"exit code {proc.returncode}, no output"
+        raise ClaudeError(detail)
+
+    if envelope is None:
         raise ClaudeError(
-            f"claude -p exited with code {proc.returncode}: {stderr.strip()[:500]}"
+            f"empty/invalid stdout from claude -p; stderr={_truncate(stderr.strip(), 500)}"
         )
 
-    stdout = stdout_b.decode("utf-8", errors="replace").strip()
-    if not stdout:
-        raise ClaudeError(f"empty stdout from claude -p; stderr={stderr.strip()[:500]}")
-    try:
-        envelope = json.loads(stdout)
-    except json.JSONDecodeError as e:
-        raise ClaudeError(f"failed to parse claude JSON envelope: {e}; head={stdout[:300]!r}")
+    usage = envelope.get("usage") or {}
+    log.info(
+        "claude -p ok: rc=0 duration=%.2fs turns=%s subtype=%s in_tok=%s cache_creation=%s cache_read=%s out_tok=%s cost=$%.5f",
+        duration,
+        envelope.get("num_turns"),
+        envelope.get("subtype"),
+        usage.get("input_tokens"),
+        usage.get("cache_creation_input_tokens"),
+        usage.get("cache_read_input_tokens"),
+        usage.get("output_tokens"),
+        envelope.get("total_cost_usd") or 0.0,
+    )
+    if log.isEnabledFor(logging.DEBUG):
+        result_text = envelope.get("result") or ""
+        struct = envelope.get("structured_output")
+        log.debug("result text: %s", _truncate(result_text, 600))
+        if struct is not None:
+            log.debug("structured_output: %s", _truncate(json.dumps(struct, ensure_ascii=False), 800))
     return ClaudeResult(raw=envelope, stderr=stderr)
 
 
@@ -153,6 +212,14 @@ async def run_streaming(
         user_prompt,
     ]
 
+    log.info(
+        "claude -p stream spawn: model=%s cwd=%s system_chars=%d user_chars=%d",
+        model, cwd, len(system_prompt), len(user_prompt),
+    )
+    if log.isEnabledFor(logging.DEBUG):
+        log.debug("system prompt: %s", _truncate(system_prompt))
+        log.debug("user prompt: %s", _truncate(user_prompt))
+
     proc = await asyncio.create_subprocess_exec(
         *args,
         stdout=asyncio.subprocess.PIPE,
@@ -170,6 +237,9 @@ async def run_streaming(
                 proc.kill()
 
     assert proc.stdout is not None
+    started = time.monotonic()
+    n_events = 0
+    last_result: dict | None = None
     try:
         while True:
             try:
@@ -187,10 +257,22 @@ async def run_streaming(
             except json.JSONDecodeError:
                 log.warning("non-JSON line on stream: %r", text[:200])
                 continue
+            n_events += 1
+            if isinstance(event, dict) and event.get("type") == "result":
+                last_result = event
+            if log.isEnabledFor(logging.DEBUG) and n_events <= 5:
+                log.debug("stream event #%d type=%s", n_events, event.get("type") if isinstance(event, dict) else "?")
             yield event
         rc = await proc.wait()
-        if rc != 0:
+        duration = time.monotonic() - started
+        if rc != 0 or (last_result and last_result.get("is_error")):
             stderr = (await proc.stderr.read()).decode("utf-8", errors="replace") if proc.stderr else ""
-            raise ClaudeError(f"claude -p (stream) exited with {rc}: {stderr.strip()[:500]}")
+            api_msg = (last_result.get("result") or "").strip() if last_result else ""
+            log.error(
+                "claude -p stream failed: rc=%s duration=%.2fs events=%d api_msg=%s stderr=%s",
+                rc, duration, n_events, _truncate(api_msg, 600), _truncate(stderr.strip(), 600),
+            )
+            raise ClaudeError(api_msg or stderr.strip() or f"exit code {rc}, no output")
+        log.info("claude -p stream ok: duration=%.2fs events=%d", duration, n_events)
     finally:
         await _kill()

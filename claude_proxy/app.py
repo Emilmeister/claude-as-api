@@ -76,12 +76,22 @@ def create_app(config: Config | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail="messages must not be empty")
 
         model = map_model(req.model, cfg.default_model)
+        roles = [m.role for m in req.messages]
+        rf_type = req.response_format.type if req.response_format else None
+        log.info(
+            "chat req: requested_model=%s -> %s msgs=%d roles=%s stream=%s tools=%d tool_choice=%s response_format=%s",
+            req.model, model, len(req.messages), roles, req.stream,
+            len(req.tools or []), req.tool_choice, rf_type,
+        )
+
         system_prompt = prompt_builder.build_system_prompt(req.messages, req.tools)
         user_prompt = prompt_builder.build_user_prompt(req.messages)
 
         semaphore: asyncio.Semaphore = request.app.state.semaphore
         force_nonstream = bool(req.tools)
         wants_stream = req.stream and not force_nonstream
+        if req.stream and force_nonstream:
+            log.info("stream requested but tools present -> falling back to non-streaming")
 
         if wants_stream:
             return _stream_response(request, cfg, semaphore, model, system_prompt, user_prompt)
@@ -139,6 +149,18 @@ async def _blocking_response(
         content = _coerce_to_text(envelope.get("structured_output"))
     else:
         content = envelope.get("result") or ""
+
+    log.info(
+        "chat resp: finish=%s content_chars=%d tool_calls=%d",
+        finish_reason, len(content or ""), len(tool_calls or []),
+    )
+    if not content and not tool_calls:
+        log.warning(
+            "empty response: envelope subtype=%s is_error=%s result=%r structured=%r",
+            envelope.get("subtype"), envelope.get("is_error"),
+            (envelope.get("result") or "")[:200],
+            envelope.get("structured_output"),
+        )
 
     message = ChatMessage(
         role="assistant",

@@ -23,6 +23,16 @@ claude /status     # interactive — should report "Claude subscription auth"
 
 The runner strips these env vars from the subprocess for safety, but you still need OAuth in `~/.claude/` to be valid (i.e. you must have logged in via `claude login`).
 
+## Debugging
+
+Set `LOG_LEVEL=DEBUG` to see full prompts, schemas, argv flag shape, and parsed structured outputs in the server log:
+
+```bash
+LOG_LEVEL=DEBUG uv run python main.py
+```
+
+At INFO (default) you still see one line per `claude -p` call with rc, duration, turn count, token counts, and cost. On failures the actual API error message (from the JSON envelope's `result`) is now surfaced through the 502 — you no longer get a bare `exited with code 1: ` with empty stderr.
+
 ## Run
 
 ```bash
